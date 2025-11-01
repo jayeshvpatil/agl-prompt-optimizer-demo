@@ -1,0 +1,76 @@
+## Python Artifacts
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+## Virtual Environments
+.venv/
+venv/
+env/
+.python-version
+
+## Dependency / Lock Artifacts
+*.lock
+poetry.lock
+Pipfile
+Pipfile.lock
+
+## Logs & Outputs
+*.log
+*.out
+*.err
+*.tmp
+prompt_optimization_results.json
+
+## Jupyter / Notebooks
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+
+## Coverage / Testing
+.coverage
+coverage.xml
+htmlcov/
+.pytest_cache/
+pytestdebug.log
+
+## IDE / Editor
+.idea/
+.vscode/
+*.code-workspace
+
+## macOS
+.DS_Store
+
+## Environment / Secrets
+.env
+.env.*
+!/.env.example
+
+## Caches
+.mypy_cache/
+.ruff_cache/
+.cache/
+__pypackages__/
+
+## Generated Diagrams / Images (optional)
+*.svg
+*.png
+*.jpg
+*.jpeg
+
+## Node (if added later)
+node_modules/
+*.tsbuildinfo
+
+## Local tooling
+.devcontainer/
+
