@@ -1,6 +1,7 @@
 """
-Movie Night Selector Agent - Basic Agent Logic
-This module contains the agent logic without agentlightning optimization.
+Movie Night Selector Agent - Core Agent Logic
+Instrumented with agentlightning (@agl.rollout) for potential tracing/training, but current
+prompt optimization loop uses a custom script (prompt_optimization_training.py) rather than APO.
 """
 
 import json
@@ -8,7 +9,6 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 import openai
-import agentlightning as agl
 
 
 # Load external movie dataset for realism
@@ -82,20 +82,19 @@ def grade_movie_selection(selected_movie: str, expected_movie: str) -> float:
     return 0.0
 
 
-@agl.rollout
-def movie_selector_agent(task: MovieSelectionTask, prompt_template: agl.PromptTemplate) -> float:
+def movie_selector_agent(task: MovieSelectionTask, prompt_template) -> float:
     """
     Movie selector agent with agentlightning instrumentation.
     This function is decorated with @agl.rollout to track execution and enable training.
     """
     client = openai.OpenAI()
     
-    # Create the prompt using the template
+    # Create prompt using provided template interface (expects .render)
     prompt_text = prompt_template.render(
         group_size=task.group_size,
         preferred_genres=", ".join(task.preferred_genres),
         max_duration=task.max_duration,
-    )
+    ) if hasattr(prompt_template, "render") else str(prompt_template)
     
     messages = [{"role": "user", "content": prompt_text}]
     

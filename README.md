@@ -76,17 +76,6 @@ Artifacts saved to:
 | Harder tasks | Edit task list in `prompt_optimization_training.py` |
 | Reduce cost | Lower rounds or switch to `gpt-3.5-turbo` |
 
-## Suggested Next Improvements
-
-1. Strict output validation (regex) to eliminate “Unknown” fallbacks
-2. Genre intersection logic for multi-genre requests
-3. Failure-only mini rounds to accelerate improvement
-4. Early stopping if no accuracy lift for 3 consecutive rounds
-
-## Clean-Up (Optional)
-
-If you want only this README + code, you can safely remove:
-`AGENT_DEMO_README.md`, `QUICK_START.md`, `INDEX.md`, `VISUAL_GUIDE.md`, `DEMO_CHECKLIST.md`.
 
 ## License & Notes
 

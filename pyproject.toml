@@ -5,8 +5,5 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "agentlightning>=0.2.1",
     "openai>=2.6.1",
-    "python-dotenv>=1.0.0",
-    "poml>=0.0.8",
 ]

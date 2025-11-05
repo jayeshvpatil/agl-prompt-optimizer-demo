@@ -15,9 +15,12 @@ Run:
 
 import json
 import os
+import random
+import re
+import argparse
 import openai
 from dataclasses import asdict
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from movie_selector_agent import (
     MovieSelectionTask,
     get_available_movies,
@@ -41,82 +44,118 @@ TRAINING_TASKS: List[MovieSelectionTask] = [
 
 # Baseline prompt (intentionally minimal)
 BASELINE_PROMPT = (
-    "Recommend the best movie for this group. Use the tool to fetch movies, then pick the single best title."  # intentionally vague
+    "You are a movie recommendation agent. Given a task (group size, genres list, max duration):\n"
+    "Steps: 1) Fetch movies with tool. 2) Filter STRICTLY: genre must be included; duration must be <= max. 3) Rank by rating desc then duration proximity to max then original genre order. 4) Return ONLY the exact movie title."
 )
 
 RESULTS_FILE = "prompt_optimization_results.json"
 
 
-def run_agent(client: openai.OpenAI, prompt: str, task: MovieSelectionTask) -> Dict[str, Any]:
+def extract_title(raw: str, movies: List[Dict[str, Any]]) -> str:
+    """Attempt strict extraction of a single movie title.
+    - Exact case-insensitive match against dataset titles.
+    - If multiple matches appear, choose highest rated among them.
+    - If none found, return 'Unknown'.
+    """
+    lowered = raw.lower()
+    matches = []
+    for m in movies:
+        title = m["title"]
+        if title.lower() in lowered:
+            matches.append(m)
+    if not matches:
+        # Try quoted pattern
+        quoted = re.findall(r'"([^\"]+)"', raw)
+        for q in quoted:
+            for m in movies:
+                if m["title"].lower() == q.lower():
+                    matches.append(m)
+        if not matches:
+            return "Unknown"
+    # Prefer highest rating if ambiguous
+    matches.sort(key=lambda x: (-x.get("rating", 0), x.get("duration", 9999)))
+    return matches[0]["title"]
+
+
+def run_agent(client: openai.OpenAI, prompt: str, task: MovieSelectionTask, mock: bool = False) -> Dict[str, Any]:
     """Execute one agent pass with given prompt and task."""
     # First call - ask model how to proceed
     user_block = (
         f"PROMPT:\n{prompt}\n\nTASK:\nGroup Size: {task.group_size}\nGenres: {', '.join(task.preferred_genres)}\nMax Duration: {task.max_duration} min\n"
     )
 
-    response1 = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": user_block}],
-        tools=[
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_available_movies",
-                    "description": "Get movies matching genres and max duration.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "preferred_genres": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                            },
-                            "max_duration": {"type": "integer"},
-                        },
-                        "required": ["preferred_genres", "max_duration"],
-                    },
-                },
-            }
-        ],
-        tool_choice="auto",
-    )
-
-    movies = []
-    if response1.choices[0].finish_reason == "tool_calls":
-        for tool_call in response1.choices[0].message.tool_calls:
-            if tool_call.function.name == "get_available_movies":
-                args = json.loads(tool_call.function.arguments)
-                movies = get_available_movies(
-                    preferred_genres=args.get("preferred_genres", task.preferred_genres),
-                    max_duration=args.get("max_duration", task.max_duration),
-                )
-    else:
-        # Model skipped tool - still supply filtered movies for fairness
+    if mock:
+        # Deterministic mock: always fetch movies (simulate tool call)
         movies = get_available_movies(task.preferred_genres, task.max_duration)
+    else:
+        response1 = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": user_block}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_available_movies",
+                        "description": "Get movies matching genres and max duration.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "preferred_genres": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                                "max_duration": {"type": "integer"},
+                            },
+                            "required": ["preferred_genres", "max_duration"],
+                        },
+                    },
+                }
+            ],
+            tool_choice="auto",
+        )
 
-    # Second call - recommendation
-    movie_payload = json.dumps(movies, indent=2)
-    rec_prompt = (
-        f"Available Movies JSON:\n{movie_payload}\n\nSelect BEST movie strictly matching genres and duration. Return ONLY title."  # explicit output constraint
-    )
-    response2 = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "user", "content": user_block},
-            {"role": "assistant", "content": response1.choices[0].message.content or ""},
-            {"role": "user", "content": rec_prompt},
-        ],
-        max_tokens=100,
-        temperature=0.4,
-    )
+        movies = []
+        if response1.choices[0].finish_reason == "tool_calls":
+            for tool_call in response1.choices[0].message.tool_calls:
+                if tool_call.function.name == "get_available_movies":
+                    args = json.loads(tool_call.function.arguments)
+                    movies = get_available_movies(
+                        preferred_genres=args.get("preferred_genres", task.preferred_genres),
+                        max_duration=args.get("max_duration", task.max_duration),
+                    )
+        else:
+            movies = get_available_movies(task.preferred_genres, task.max_duration)
 
-    final_text = response2.choices[0].message.content.strip()
+    if mock:
+        # Heuristic selection for mock mode
+        if not movies:
+            final_text = "Unknown"
+        else:
+            # Rank per baseline rules
+            ranked = sorted(
+                movies,
+                key=lambda m: (-m.get("rating", 0), abs(task.max_duration - m.get("duration", 9999))),
+            )
+            final_text = ranked[0]["title"]
+    else:
+        movie_payload = json.dumps(movies, indent=2)
+        rec_prompt = (
+            f"Available Movies JSON:\n{movie_payload}\n\nSelect BEST movie strictly matching genres and duration. Return ONLY title."  # explicit output constraint
+        )
+        response2 = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "user", "content": user_block},
+                {"role": "assistant", "content": response1.choices[0].message.content or ""},
+                {"role": "user", "content": rec_prompt},
+            ],
+            max_tokens=60,
+            temperature=0.3,
+        )
+        final_text = response2.choices[0].message.content.strip()
 
     # Extract movie title
-    recommended_title = "Unknown"
-    for m in movies:
-        if m["title"].lower() in final_text.lower():
-            recommended_title = m["title"]
-            break
+    recommended_title = extract_title(final_text, movies)
 
     reward = grade_movie_selection(recommended_title, task.expected_movie_title)
     correct = reward >= 0.8
@@ -131,9 +170,9 @@ def run_agent(client: openai.OpenAI, prompt: str, task: MovieSelectionTask) -> D
     }
 
 
-def evaluate_prompt(client: openai.OpenAI, prompt: str) -> Dict[str, Any]:
+def evaluate_prompt(client: openai.OpenAI, prompt: str, tasks: List[MovieSelectionTask], mock: bool = False) -> Dict[str, Any]:
     """Run prompt over all tasks and build confusion map (expected->recommended counts)."""
-    results = [run_agent(client, prompt, t) for t in TRAINING_TASKS]
+    results = [run_agent(client, prompt, t, mock=mock) for t in tasks]
     accuracy = sum(r["correct"] for r in results) / len(results)
     avg_reward = sum(r["reward"] for r in results) / len(results)
 
@@ -153,11 +192,15 @@ def evaluate_prompt(client: openai.OpenAI, prompt: str) -> Dict[str, Any]:
     }
 
 
-def critique_and_rewrite(client: openai.OpenAI, previous_round: Dict[str, Any]) -> str:
+def critique_and_rewrite(client: openai.OpenAI, previous_round: Dict[str, Any], failures: List[Dict[str, Any]], mock: bool) -> str:
     """Generate improved prompt via self-critique."""
-    examples_failures = [r for r in previous_round["results"] if not r["correct"]][:3]
+    if mock:
+        # In mock mode just return previous prompt (no real critique) for determinism
+        return previous_round["prompt"]
+
+    examples_failures = failures[:5]
     failures_text = "\n".join(
-        f"Expected: {f['expected']}, Got: {f['recommended']} (reward={f['reward']})" for f in examples_failures
+        f"Expected: {f['expected']}, Got: {f['recommended']} (reward={f['reward']:.2f})" for f in examples_failures
     ) or "(No failures captured)"
 
     critique = f"""You are optimizing a MOVIE RECOMMENDATION AGENT prompt.
@@ -195,11 +238,25 @@ def save_results(history: List[Dict[str, Any]]):
         json.dump(history, f, indent=2)
 
 
+def split_tasks(tasks: List[MovieSelectionTask], val_ratio: float, seed: int) -> Tuple[List[MovieSelectionTask], List[MovieSelectionTask]]:
+    random.Random(seed).shuffle(tasks)
+    val_count = max(1, int(len(tasks) * val_ratio))
+    return tasks[val_count:], tasks[:val_count]
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Iterative prompt optimization")
+    parser.add_argument("--rounds", type=int, default=8, help="Max optimization rounds")
+    parser.add_argument("--val-ratio", type=float, default=0.3, help="Validation split ratio")
+    parser.add_argument("--patience", type=int, default=3, help="Early stopping patience on val accuracy")
+    parser.add_argument("--seed", type=int, default=42, help="Shuffle seed for task split")
+    parser.add_argument("--mock", action="store_true", help="Run without real OpenAI calls (heuristic only)")
+    args = parser.parse_args()
+
     api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY not set")
-    client = openai.OpenAI(api_key=api_key)
+    if not api_key and not args.mock:
+        raise ValueError("OPENAI_API_KEY not set (required unless --mock)")
+    client = openai.OpenAI(api_key=api_key) if not args.mock else None  # type: ignore
 
     print("=" * 80)
     print("REAL PROMPT OPTIMIZATION TRAINING")
@@ -209,57 +266,76 @@ def main():
     history: List[Dict[str, Any]] = []
 
     # Baseline evaluation
-    print("Baseline evaluation...")
-    baseline_round = evaluate_prompt(client, BASELINE_PROMPT)
-    history.append({"round": 0, **baseline_round})
-    print(f"Baseline Accuracy: {baseline_round['accuracy']*100:.1f}% | Avg Reward: {baseline_round['avg_reward']:.2f}\n")
+    # Task split
+    train_tasks, val_tasks = split_tasks(TRAINING_TASKS, args.val_ratio, args.seed)
+    print(f"Train tasks: {len(train_tasks)} | Val tasks: {len(val_tasks)}")
 
-    current_round = baseline_round
+    print("Baseline evaluation (train + val)...")
+    baseline_train = evaluate_prompt(client, BASELINE_PROMPT, train_tasks, mock=args.mock)
+    baseline_val = evaluate_prompt(client, BASELINE_PROMPT, val_tasks, mock=args.mock)
+    history.append({"round": 0, "split": "train", **baseline_train})
+    history.append({"round": 0, "split": "val", **baseline_val})
+    print(
+        f"Baseline Train Acc: {baseline_train['accuracy']*100:.1f}% | Val Acc: {baseline_val['accuracy']*100:.1f}%\n"
+    )
+
+    best_val_acc = baseline_val["accuracy"]
+    best_prompt = BASELINE_PROMPT
+    patience_counter = 0
     current_prompt = BASELINE_PROMPT
+    current_train_round = baseline_train
 
-    total_rounds = 8
-    # Iterative optimization rounds (extended)
-    for round_idx in range(1, total_rounds + 1):
+    for round_idx in range(1, args.rounds + 1):
         print(f"Round {round_idx} optimization...")
-        improved_prompt = critique_and_rewrite(client, current_round)
-        eval_round = evaluate_prompt(client, improved_prompt)
-        history.append({"round": round_idx, **eval_round})
+        failures = [r for r in current_train_round["results"] if not r["correct"]]
+        improved_prompt = critique_and_rewrite(client, current_train_round, failures, mock=args.mock)
+        train_eval = evaluate_prompt(client, improved_prompt, train_tasks, mock=args.mock)
+        val_eval = evaluate_prompt(client, improved_prompt, val_tasks, mock=args.mock)
+        history.append({"round": round_idx, "split": "train", **train_eval})
+        history.append({"round": round_idx, "split": "val", **val_eval})
 
-        improvement = eval_round["accuracy"] - current_round["accuracy"]
+        train_impr = train_eval["accuracy"] - current_train_round["accuracy"]
+        val_impr = val_eval["accuracy"] - best_val_acc
         print(
-            f"  Accuracy: {eval_round['accuracy']*100:.1f}% (Δ {improvement*100:+.1f}%) | Avg Reward: {eval_round['avg_reward']:.2f}"
+            f"  Train Acc: {train_eval['accuracy']*100:.1f}% (Δ {train_impr*100:+.1f}%) | Val Acc: {val_eval['accuracy']*100:.1f}% (best {best_val_acc*100:.1f}%)"
         )
 
-        # Print top 2 confusion issues if any
+        # Mis-selections (val set for generalization signal)
         wrong_pairs = []
-        for exp, mapping in eval_round["confusion"].items():
+        for exp, mapping in val_eval["confusion"].items():
             for rec, count in mapping.items():
                 if rec != exp:
                     wrong_pairs.append((exp, rec, count))
         wrong_pairs.sort(key=lambda x: -x[2])
         if wrong_pairs:
-            print("  Most common mis-selections:")
+            print("  Val mis-selections (top 2):")
             for exp, rec, count in wrong_pairs[:2]:
                 print(f"    • Expected '{exp}' got '{rec}' x{count}")
         else:
-            print("  No mis-selections this round.")
+            print("  No val mis-selections this round.")
 
-        current_round = eval_round
+        # Early stopping logic
+        if val_eval["accuracy"] > best_val_acc + 1e-6:
+            best_val_acc = val_eval["accuracy"]
+            best_prompt = improved_prompt
+            patience_counter = 0
+            print("  ✅ New best validation accuracy.")
+        else:
+            patience_counter += 1
+            print(f"  (No val improvement) Patience {patience_counter}/{args.patience}")
+            if patience_counter >= args.patience:
+                print("  🔴 Early stopping triggered.")
+                break
+
+        current_train_round = train_eval
         current_prompt = improved_prompt
         print()
 
-    # Final summary
     print("=" * 80)
-    final = history[-1]
-    baseline = history[0]
-    total_improvement = final["accuracy"] - baseline["accuracy"]
-    print(
-        f"Final Accuracy: {final['accuracy']*100:.1f}% (Baseline {baseline['accuracy']*100:.1f}%, Δ {total_improvement*100:+.1f}%)"
-    )
-    print(f"Final Prompt:\n{current_prompt}\n")
-
+    print(f"Best Validation Accuracy: {best_val_acc*100:.1f}%")
+    print(f"Best Prompt:\n{best_prompt}\n")
     save_results(history)
-    print(f"Results saved to {RESULTS_FILE}\n")
+    print(f"Results saved to {RESULTS_FILE}")
 
 
 if __name__ == "__main__":
